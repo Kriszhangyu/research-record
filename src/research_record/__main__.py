@@ -1,4 +1,4 @@
-from .enhancements import apply
+from .enhancements_fixed import apply
 
 apply()
 
