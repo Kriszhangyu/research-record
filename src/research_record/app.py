@@ -14,7 +14,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Callable
 
-from PySide6.QtCore import QDate, Qt, QTimer, Signal
+from PySide6.QtCore import QDate, QDateTime, Qt, QTimer, Signal
 from PySide6.QtGui import QBrush, QColor, QFont, QPainter, QPen, QPixmap, QTextCharFormat
 from PySide6.QtWidgets import (
     QApplication,
@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDialog,
+    QDateTimeEdit,
     QFileDialog,
     QFormLayout,
     QFrame,
@@ -117,6 +118,18 @@ def task_due_to_label(value: str | None) -> str:
         return value
 
 
+def is_task_overdue(task: dict) -> bool:
+    if task.get("completed"):
+        return False
+    due = task.get("due_at") or task.get("due")
+    if not due:
+        return False
+    try:
+        return datetime.fromisoformat(due) < datetime.now()
+    except ValueError:
+        return False
+
+
 def safe_folder_name(value: str) -> str:
     cleaned = "".join(ch for ch in value.strip() if ch not in r'\/:*?"<>|')
     return cleaned or "未分类"
@@ -182,6 +195,9 @@ class Store:
             CREATE TABLE IF NOT EXISTS daily_tasks (
                 id TEXT PRIMARY KEY,
                 day TEXT NOT NULL,
+                content TEXT NOT NULL DEFAULT '',
+                priority TEXT NOT NULL DEFAULT 'urgent_important',
+                due_at TEXT,
                 title TEXT NOT NULL,
                 completed INTEGER NOT NULL DEFAULT 0,
                 quadrant TEXT NOT NULL,
@@ -202,11 +218,30 @@ class Store:
             );
             """
         )
+        self.ensure_daily_task_columns()
         for key, value in DEFAULT_THEME.items():
             self.set_setting(f"theme.{key}", str(value), overwrite=False)
         self.set_setting("background.type", "color", overwrite=False)
         self.set_setting("background.value", DEFAULT_THEME["window"], overwrite=False)
         self.set_setting("last_user", USER, overwrite=False)
+        self.conn.commit()
+
+    def ensure_daily_task_columns(self) -> None:
+        columns = {row["name"] for row in self.conn.execute("PRAGMA table_info(daily_tasks)")}
+        additions = {
+            "content": "ALTER TABLE daily_tasks ADD COLUMN content TEXT NOT NULL DEFAULT ''",
+            "priority": "ALTER TABLE daily_tasks ADD COLUMN priority TEXT NOT NULL DEFAULT 'urgent_important'",
+            "due_at": "ALTER TABLE daily_tasks ADD COLUMN due_at TEXT",
+            "title": "ALTER TABLE daily_tasks ADD COLUMN title TEXT NOT NULL DEFAULT ''",
+            "quadrant": "ALTER TABLE daily_tasks ADD COLUMN quadrant TEXT NOT NULL DEFAULT 'urgent_important'",
+            "due": "ALTER TABLE daily_tasks ADD COLUMN due TEXT",
+        }
+        for name, ddl in additions.items():
+            if name not in columns:
+                self.conn.execute(ddl)
+        self.conn.execute("UPDATE daily_tasks SET content = title WHERE (content IS NULL OR content = '') AND title IS NOT NULL")
+        self.conn.execute("UPDATE daily_tasks SET priority = quadrant WHERE (priority IS NULL OR priority = '') AND quadrant IS NOT NULL")
+        self.conn.execute("UPDATE daily_tasks SET due_at = due WHERE (due_at IS NULL OR due_at = '') AND due IS NOT NULL")
         self.conn.commit()
 
     def migrate_legacy_json_once(self) -> None:
@@ -231,12 +266,15 @@ class Store:
                     self.conn.execute(
                         """
                         INSERT OR IGNORE INTO daily_tasks
-                        (id, day, title, completed, quadrant, due, created_at, updated_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        (id, day, content, priority, due_at, title, completed, quadrant, due, created_at, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             task.get("id", str(time.time_ns())),
                             day,
+                            task.get("title", ""),
+                            task.get("quadrant", "urgent_important"),
+                            task.get("due"),
                             task.get("title", ""),
                             1 if task.get("completed") else 0,
                             task.get("quadrant", "urgent_important"),
@@ -316,13 +354,19 @@ class Store:
     def load_data(self) -> dict:
         tasks: dict[str, list[dict]] = {}
         for row in self.conn.execute("SELECT * FROM daily_tasks ORDER BY created_at"):
+            content = row["content"] or row["title"] or ""
+            priority = row["priority"] or row["quadrant"] or "urgent_important"
+            due_at = row["due_at"] or row["due"]
             tasks.setdefault(row["day"], []).append(
                 {
                     "id": row["id"],
-                    "title": row["title"],
+                    "content": content,
+                    "title": content,
                     "completed": bool(row["completed"]),
-                    "quadrant": row["quadrant"],
-                    "due": row["due"],
+                    "priority": priority,
+                    "quadrant": priority,
+                    "due_at": due_at,
+                    "due": due_at,
                 }
             )
         reflections = {row["day"]: row["body"] for row in self.conn.execute("SELECT * FROM daily_reflections")}
@@ -383,17 +427,19 @@ class Store:
     def all_today_tasks(self) -> list[dict]:
         return self.tasks_for(today_key())
 
-    def add_task(self, title: str, quadrant: str, due: str | None = None) -> None:
-        title = title.strip()
-        if not title:
+    def add_task(self, content: str, priority: str, due_at: str | None = None) -> None:
+        content = content.strip()
+        if not content:
             return
         task_id = str(time.time_ns())
+        due_value = due_at or datetime.combine(date.today(), datetime.max.time()).replace(microsecond=0).isoformat()
         self.conn.execute(
             """
-            INSERT INTO daily_tasks (id, day, title, completed, quadrant, due, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO daily_tasks
+            (id, day, content, priority, due_at, title, completed, quadrant, due, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (task_id, today_key(), title, 0, quadrant, due or now_iso(), now_iso(), now_iso()),
+            (task_id, today_key(), content, priority, due_value, content, 0, priority, due_value, now_iso(), now_iso()),
         )
         self.save()
 
@@ -1058,13 +1104,28 @@ class TaskRow(QWidget):
         done = QPushButton("✓" if task.get("completed") else "○")
         done.setFixedWidth(38)
         done.clicked.connect(self.toggle_done)
-        text = QLabel(f"{task.get('title', '')}  {task_due_to_label(task.get('due'))}")
+        priority = task.get("priority") or task.get("quadrant", "urgent_important")
+        priority_label, priority_color = QUADRANTS.get(priority, QUADRANTS["urgent_important"])
+        flag = QLabel("⚑")
+        flag.setFixedWidth(24)
+        flag.setAlignment(Qt.AlignCenter)
+        flag.setToolTip(priority_label)
+        flag.setStyleSheet(f"color:{priority_color}; font-size:18px; font-weight:800;")
+        due_text = task_due_to_label(task.get("due_at") or task.get("due"))
+        overdue = is_task_overdue(task)
+        suffix = f"  截止：{due_text}" if due_text else ""
+        if overdue:
+            suffix += "  已逾期"
+        text = QLabel(f"{task.get('content') or task.get('title', '')}{suffix}")
         text.setWordWrap(True)
         text.setObjectName("muted" if task.get("completed") else "normalText")
+        if overdue:
+            text.setStyleSheet("color:#d84a3a; font-weight:700;")
         delete = QPushButton("删除")
         delete.setObjectName("dangerButton")
         delete.clicked.connect(self.delete)
         layout.addWidget(done)
+        layout.addWidget(flag)
         layout.addWidget(text, 1)
         if not compact:
             layout.addWidget(delete)
@@ -1074,7 +1135,7 @@ class TaskRow(QWidget):
         self.changed.emit()
 
     def delete(self) -> None:
-        reply = QMessageBox.question(self, "删除任务", f"确定删除任务“{self.task.get('title', '')}”吗？")
+        reply = QMessageBox.question(self, "删除任务", f"确定删除任务“{self.task.get('content') or self.task.get('title', '')}”吗？")
         if reply == QMessageBox.Yes:
             self.store.delete_task(self.task["id"])
             self.changed.emit()
@@ -1110,9 +1171,17 @@ class TodayPage(QWidget):
         add_row = QHBoxLayout()
         self.quick_task = QLineEdit()
         self.quick_task.setPlaceholderText("新增今日任务")
+        self.quick_priority = QComboBox()
+        for key, (label, _) in QUADRANTS.items():
+            self.quick_priority.addItem(label, key)
+        self.quick_due = QDateTimeEdit(QDateTime.currentDateTime())
+        self.quick_due.setDisplayFormat("yyyy-MM-dd HH:mm")
+        self.quick_due.setCalendarPopup(True)
         add = QPushButton("添加")
         add.clicked.connect(self.add_task)
-        add_row.addWidget(self.quick_task, 1)
+        add_row.addWidget(self.quick_task, 2)
+        add_row.addWidget(self.quick_priority)
+        add_row.addWidget(self.quick_due)
         add_row.addWidget(add)
         self.today_tasks = QVBoxLayout()
         tasks.layout.addLayout(add_row)
@@ -1149,8 +1218,13 @@ class TodayPage(QWidget):
             self.state.refresh()
 
     def add_task(self) -> None:
-        self.state.store.add_task(self.quick_task.text(), "urgent_important")
+        self.state.store.add_task(
+            self.quick_task.text(),
+            self.quick_priority.currentData(),
+            self.quick_due.dateTime().toPython().replace(microsecond=0).isoformat(),
+        )
         self.quick_task.clear()
+        self.quick_due.setDateTime(QDateTime.currentDateTime())
         self.state.refresh()
 
     def refresh(self) -> None:
@@ -1181,7 +1255,9 @@ class TasksPage(QWidget):
         self.quadrant = QComboBox()
         for key, (label, _) in QUADRANTS.items():
             self.quadrant.addItem(label, key)
-        self.due = QLineEdit(datetime.now().strftime("%Y-%m-%d %H:%M"))
+        self.due = QDateTimeEdit(QDateTime.currentDateTime())
+        self.due.setDisplayFormat("yyyy-MM-dd HH:mm")
+        self.due.setCalendarPopup(True)
         add = QPushButton("添加任务")
         add.clicked.connect(self.add_task)
         row.addWidget(self.title, 2)
@@ -1196,15 +1272,20 @@ class TasksPage(QWidget):
         self.refresh()
 
     def add_task(self) -> None:
-        self.state.store.add_task(self.title.text(), self.quadrant.currentData(), self.due.text())
+        self.state.store.add_task(
+            self.title.text(),
+            self.quadrant.currentData(),
+            self.due.dateTime().toPython().replace(microsecond=0).isoformat(),
+        )
         self.title.clear()
+        self.due.setDateTime(QDateTime.currentDateTime())
         self.state.refresh()
 
     def refresh(self) -> None:
         clear_layout(self.grid)
         by_quad = {key: [] for key in QUADRANTS}
         for task in self.state.store.all_today_tasks():
-            by_quad.setdefault(task.get("quadrant", "urgent_important"), []).append(task)
+            by_quad.setdefault(task.get("priority") or task.get("quadrant", "urgent_important"), []).append(task)
         for index, (key, (label, color)) in enumerate(QUADRANTS.items()):
             card = Card(label)
             card.setStyleSheet(f"QFrame#card {{ border-top: 5px solid {color}; }}")
