@@ -1,4 +1,4 @@
-from research_record.enhancements import apply
+from research_record.enhancements_fixed import apply
 
 apply()
 
