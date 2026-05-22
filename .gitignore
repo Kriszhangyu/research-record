@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.venv/
+build/
+dist/
+*.spec
+*.log
+*.tmp
+*.bak
+runtime/
+*.zip
+
+# Local private runtime data
+config.json
+数据/
+assets/background.png
