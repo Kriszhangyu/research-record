@@ -5,6 +5,7 @@ import os
 import hashlib
 import secrets
 import shutil
+import sqlite3
 import sys
 import time
 import webbrowser
@@ -17,7 +18,6 @@ from PySide6.QtCore import QDate, Qt, QTimer, Signal
 from PySide6.QtGui import QBrush, QColor, QFont, QPainter, QPen, QPixmap, QTextCharFormat
 from PySide6.QtWidgets import (
     QApplication,
-    QButtonGroup,
     QCalendarWidget,
     QCheckBox,
     QComboBox,
@@ -27,10 +27,9 @@ from PySide6.QtWidgets import (
     QFrame,
     QGridLayout,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
-    QListWidget,
-    QListWidgetItem,
     QMainWindow,
     QMessageBox,
     QPushButton,
@@ -48,7 +47,7 @@ from PySide6.QtWidgets import (
 APP_DIR = Path(r"E:\科研记录")
 DATA_DIR = APP_DIR / "数据"
 IMAGE_DIR = DATA_DIR / "images"
-CONFIG_PATH = APP_DIR / "config.json"
+DB_PATH = DATA_DIR / "research_record.db"
 USER = "kris"
 
 
@@ -68,6 +67,11 @@ DEFAULT_THEME = {
     "input_opacity": 78,
     "background_opacity": 32,
 }
+
+TAG_COLORS = [
+    "#4F8EF7", "#F47C7C", "#68B984", "#F3B34C", "#A98BE8",
+    "#39A7A5", "#E98768", "#7A9E65", "#D65DB1", "#5D8AA8",
+]
 
 QUADRANTS = {
     "urgent_important": ("紧急重要", "#ef6f6c"),
@@ -99,13 +103,6 @@ def read_json(path: Path, default: dict) -> dict:
         return default
 
 
-def write_json(path: Path, data: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(path)
-
-
 def rgba(hex_color: str, opacity: int) -> str:
     c = QColor(hex_color)
     return f"rgba({c.red()}, {c.green()}, {c.blue()}, {max(0, min(100, opacity)) / 100:.2f})"
@@ -125,68 +122,262 @@ def safe_folder_name(value: str) -> str:
     return cleaned or "未分类"
 
 
+def readable_text_color(hex_color: str) -> str:
+    color = QColor(hex_color)
+    return "#ffffff" if color.isValid() and color.lightness() < 128 else "#2f211b"
+
+
 class Store:
     def __init__(self, user: str = USER) -> None:
         APP_DIR.mkdir(parents=True, exist_ok=True)
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         IMAGE_DIR.mkdir(parents=True, exist_ok=True)
-        self.config = read_json(CONFIG_PATH, self.default_config())
-        self.config.setdefault("theme", DEFAULT_THEME.copy())
-        self.config.setdefault("users", {})
-        self.config.setdefault("last_user", user or USER)
-        self.user = user or self.config.get("last_user", USER)
-        self.config["last_user"] = self.user
-        self.config["users"].setdefault(
-            self.user,
-            {
-                "data_dir": str(DATA_DIR),
-                "created_at": now_iso(),
-                "background": {"type": "color", "value": DEFAULT_THEME["window"]},
-            },
+        self.conn = sqlite3.connect(DB_PATH)
+        self.conn.row_factory = sqlite3.Row
+        self.init_db()
+        self.migrate_legacy_json_once()
+        self.user = user or self.get_setting("last_user", USER)
+        self.set_setting("last_user", self.user)
+        self.ensure_user(self.user)
+        self.data_path = DB_PATH
+        self.data = self.load_data()
+
+    def init_db(self) -> None:
+        self.conn.executescript(
+            """
+            PRAGMA foreign_keys = ON;
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS users (
+                username TEXT PRIMARY KEY,
+                salt TEXT,
+                password_hash TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS tags (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                color TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS image_records (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                tag_id INTEGER NOT NULL,
+                image_path TEXT NOT NULL,
+                note TEXT,
+                doi TEXT,
+                doi_url TEXT,
+                scholar_url TEXT,
+                cnki_url TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(tag_id) REFERENCES tags(id)
+            );
+            CREATE TABLE IF NOT EXISTS daily_tasks (
+                id TEXT PRIMARY KEY,
+                day TEXT NOT NULL,
+                title TEXT NOT NULL,
+                completed INTEGER NOT NULL DEFAULT 0,
+                quadrant TEXT NOT NULL,
+                due TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS study_sessions (
+                id TEXT PRIMARY KEY,
+                day TEXT NOT NULL,
+                seconds INTEGER NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS daily_reflections (
+                day TEXT PRIMARY KEY,
+                body TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            """
         )
-        self.data_path = DATA_DIR / f"{self.user}_data.json"
-        self.data = read_json(self.data_path, self.default_data())
-        self.save()
+        for key, value in DEFAULT_THEME.items():
+            self.set_setting(f"theme.{key}", str(value), overwrite=False)
+        self.set_setting("background.type", "color", overwrite=False)
+        self.set_setting("background.value", DEFAULT_THEME["window"], overwrite=False)
+        self.set_setting("last_user", USER, overwrite=False)
+        self.conn.commit()
 
-    @staticmethod
-    def default_config() -> dict:
-        return {
-            "last_user": USER,
-            "users": {
-                USER: {
-                    "data_dir": str(DATA_DIR),
-                    "created_at": now_iso(),
-                    "background": {"type": "color", "value": DEFAULT_THEME["window"]},
-                }
-            },
-            "theme": DEFAULT_THEME.copy(),
-        }
+    def migrate_legacy_json_once(self) -> None:
+        if self.get_setting("migration.legacy_json_done", "0") == "1":
+            return
+        legacy_config = APP_DIR / "config.json"
+        legacy_data = DATA_DIR / f"{USER}_data.json"
+        if legacy_config.exists():
+            config = read_json(legacy_config, {})
+            for key, value in config.get("theme", {}).items():
+                if key in DEFAULT_THEME:
+                    self.set_setting(f"theme.{key}", str(value), overwrite=False)
+            bg = config.get("users", {}).get(config.get("last_user", USER), {}).get("background", {})
+            if bg:
+                self.set_setting("background.type", bg.get("type", "color"), overwrite=False)
+                self.set_setting("background.value", bg.get("value", DEFAULT_THEME["window"]), overwrite=False)
+            self.set_setting("last_user", config.get("last_user", USER), overwrite=False)
+        if legacy_data.exists():
+            data = read_json(legacy_data, {})
+            for day, tasks in data.get("daily_tasks", {}).items():
+                for task in tasks:
+                    self.conn.execute(
+                        """
+                        INSERT OR IGNORE INTO daily_tasks
+                        (id, day, title, completed, quadrant, due, created_at, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            task.get("id", str(time.time_ns())),
+                            day,
+                            task.get("title", ""),
+                            1 if task.get("completed") else 0,
+                            task.get("quadrant", "urgent_important"),
+                            task.get("due"),
+                            now_iso(),
+                            now_iso(),
+                        ),
+                    )
+            for session in data.get("study_sessions", []):
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO study_sessions (id, day, seconds, created_at) VALUES (?, ?, ?, ?)",
+                    (session.get("id", str(time.time_ns())), session.get("date", today_key()), session.get("seconds", 0), session.get("created_at", now_iso())),
+                )
+            for day, text in data.get("daily_reflections", {}).items():
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO daily_reflections (day, body, updated_at) VALUES (?, ?, ?)",
+                    (day, text or "", now_iso()),
+                )
+            for note in data.get("figure_notes", []):
+                tags = note.get("tags") or ["未分类"]
+                tag = tags[0]
+                tag_id, tag_color = self.get_or_create_tag(tag)
+                for image in note.get("images", []):
+                    image_path = image.get("value", "")
+                    rel_path = self.relative_image_path(image_path, tag)
+                    self.conn.execute(
+                        """
+                        INSERT INTO image_records
+                        (title, tag_id, image_path, note, doi, doi_url, scholar_url, cnki_url, created_at, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            note.get("title", "未命名图谱"),
+                            tag_id,
+                            rel_path,
+                            note.get("body", ""),
+                            note.get("doi", ""),
+                            note.get("doi_url", ""),
+                            note.get("scholar_url", ""),
+                            note.get("cnki_url", ""),
+                            note.get("created_at", now_iso()),
+                            now_iso(),
+                        ),
+                    )
+        self.set_setting("migration.legacy_json_done", "1")
+        self.conn.commit()
 
-    @staticmethod
-    def default_data() -> dict:
-        return {
-            "study_sessions": [],
-            "daily_tasks": {},
-            "daily_reflections": {},
-            "figure_notes": [],
-            "active_session": None,
-        }
+    def get_setting(self, key: str, default: str = "") -> str:
+        row = self.conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+        return row["value"] if row else default
+
+    def set_setting(self, key: str, value: str, overwrite: bool = True) -> None:
+        if not overwrite and self.conn.execute("SELECT 1 FROM settings WHERE key = ?", (key,)).fetchone():
+            return
+        self.conn.execute(
+            """
+            INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+            """,
+            (key, str(value), now_iso()),
+        )
+        self.conn.commit()
+
+    def ensure_user(self, username: str) -> None:
+        self.conn.execute(
+            """
+            INSERT OR IGNORE INTO users (username, created_at, updated_at) VALUES (?, ?, ?)
+            """,
+            (username, now_iso(), now_iso()),
+        )
+        self.conn.commit()
 
     def save(self) -> None:
-        write_json(CONFIG_PATH, self.config)
-        write_json(self.data_path, self.data)
+        self.conn.commit()
+        self.data = self.load_data()
+
+    def load_data(self) -> dict:
+        tasks: dict[str, list[dict]] = {}
+        for row in self.conn.execute("SELECT * FROM daily_tasks ORDER BY created_at"):
+            tasks.setdefault(row["day"], []).append(
+                {
+                    "id": row["id"],
+                    "title": row["title"],
+                    "completed": bool(row["completed"]),
+                    "quadrant": row["quadrant"],
+                    "due": row["due"],
+                }
+            )
+        reflections = {row["day"]: row["body"] for row in self.conn.execute("SELECT * FROM daily_reflections")}
+        sessions = [
+            {"id": row["id"], "date": row["day"], "seconds": row["seconds"], "created_at": row["created_at"]}
+            for row in self.conn.execute("SELECT * FROM study_sessions")
+        ]
+        figures = []
+        for row in self.conn.execute(
+            """
+            SELECT image_records.*, tags.name AS tag_name, tags.color AS tag_color
+            FROM image_records JOIN tags ON image_records.tag_id = tags.id
+            ORDER BY image_records.created_at DESC, image_records.id DESC
+            """
+        ):
+            abs_path = str(DATA_DIR / row["image_path"])
+            figures.append(
+                {
+                    "id": str(row["id"]),
+                    "title": row["title"],
+                    "doi": row["doi"] or "",
+                    "doi_url": row["doi_url"] or "",
+                    "scholar_url": row["scholar_url"] or "",
+                    "cnki_url": row["cnki_url"] or "",
+                    "tags": [row["tag_name"]],
+                    "tag_color": row["tag_color"],
+                    "body": row["note"] or "",
+                    "created_date": row["created_at"][:10],
+                    "created_at": row["created_at"],
+                    "images": [{"kind": "file", "value": abs_path, "relative": row["image_path"]}],
+                }
+            )
+        return {
+            "study_sessions": sessions,
+            "daily_tasks": tasks,
+            "daily_reflections": reflections,
+            "figure_notes": figures,
+            "active_session": None,
+        }
 
     @property
     def theme(self) -> dict:
         theme = DEFAULT_THEME.copy()
-        theme.update(self.config.get("theme", {}))
+        for key, default in DEFAULT_THEME.items():
+            raw = self.get_setting(f"theme.{key}", str(default))
+            theme[key] = int(raw) if isinstance(default, int) else raw
         return theme
 
     def set_theme(self, theme: dict) -> None:
-        self.config["theme"] = theme
-        self.save()
+        for key, value in theme.items():
+            self.set_setting(f"theme.{key}", str(value))
+        self.data = self.load_data()
 
     def tasks_for(self, day: str) -> list[dict]:
+        self.data = self.load_data()
         return self.data.setdefault("daily_tasks", {}).setdefault(day, [])
 
     def all_today_tasks(self) -> list[dict]:
@@ -196,14 +387,13 @@ class Store:
         title = title.strip()
         if not title:
             return
-        self.all_today_tasks().append(
-            {
-                "id": str(time.time_ns()),
-                "title": title,
-                "completed": False,
-                "quadrant": quadrant,
-                "due": due or now_iso(),
-            }
+        task_id = str(time.time_ns())
+        self.conn.execute(
+            """
+            INSERT INTO daily_tasks (id, day, title, completed, quadrant, due, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (task_id, today_key(), title, 0, quadrant, due or now_iso(), now_iso(), now_iso()),
         )
         self.save()
 
@@ -212,50 +402,166 @@ class Store:
             if task["id"] == task_id:
                 task["completed"] = done
                 break
+        self.conn.execute("UPDATE daily_tasks SET completed = ?, updated_at = ? WHERE id = ?", (1 if done else 0, now_iso(), task_id))
         self.save()
 
     def delete_task(self, task_id: str) -> None:
-        tasks = self.all_today_tasks()
-        self.data["daily_tasks"][today_key()] = [t for t in tasks if t["id"] != task_id]
+        self.conn.execute("DELETE FROM daily_tasks WHERE id = ?", (task_id,))
         self.save()
 
     def add_session(self, seconds: int) -> None:
         if seconds <= 0:
             return
-        self.data.setdefault("study_sessions", []).append(
-            {"id": str(time.time_ns()), "date": today_key(), "seconds": seconds, "created_at": now_iso()}
+        self.conn.execute(
+            "INSERT INTO study_sessions (id, day, seconds, created_at) VALUES (?, ?, ?, ?)",
+            (str(time.time_ns()), today_key(), seconds, now_iso()),
         )
         self.save()
 
     def study_seconds(self, day: str) -> int:
-        return sum(s.get("seconds", 0) for s in self.data.get("study_sessions", []) if s.get("date") == day)
+        row = self.conn.execute("SELECT COALESCE(SUM(seconds), 0) AS total FROM study_sessions WHERE day = ?", (day,)).fetchone()
+        return int(row["total"] or 0)
 
     def save_reflection(self, text: str) -> None:
-        self.data.setdefault("daily_reflections", {})[today_key()] = text
+        self.conn.execute(
+            """
+            INSERT INTO daily_reflections (day, body, updated_at) VALUES (?, ?, ?)
+            ON CONFLICT(day) DO UPDATE SET body = excluded.body, updated_at = excluded.updated_at
+            """,
+            (today_key(), text, now_iso()),
+        )
         self.save()
 
     def add_figure(self, payload: dict, image_paths: list[str]) -> None:
-        saved_images = []
         tags = payload.get("tags", [])
-        folder = IMAGE_DIR / safe_folder_name(tags[0] if tags else "未分类")
+        tag_name = tags[0] if tags else "未分类"
+        tag_id, tag_color = self.get_or_create_tag(tag_name)
+        folder = IMAGE_DIR / safe_folder_name(tag_name)
         folder.mkdir(parents=True, exist_ok=True)
-        for src in image_paths:
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        for index, src in enumerate(image_paths, start=1):
             p = Path(src)
             if p.exists():
-                dest = folder / f"{time.time_ns()}_{p.name}"
+                suffix = p.suffix.lower() if p.suffix.lower() in [".png", ".jpg", ".jpeg"] else ".png"
+                dest = folder / f"{stamp}_{safe_folder_name(tag_name)}_{index:03d}{suffix}"
+                counter = index
+                while dest.exists():
+                    counter += 1
+                    dest = folder / f"{stamp}_{safe_folder_name(tag_name)}_{counter:03d}{suffix}"
                 shutil.copy2(p, dest)
-                saved_images.append({"kind": "file", "value": str(dest)})
-        payload["id"] = str(time.time_ns())
-        payload["created_date"] = today_key()
-        payload["created_at"] = now_iso()
-        payload["images"] = saved_images
-        self.data.setdefault("figure_notes", []).insert(0, payload)
+                rel_path = str(dest.relative_to(DATA_DIR)).replace("\\", "/")
+            else:
+                rel_path = self.relative_image_path(src, tag_name)
+            self.conn.execute(
+                """
+                INSERT INTO image_records
+                (title, tag_id, image_path, note, doi, doi_url, scholar_url, cnki_url, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    payload.get("title", "未命名图谱"),
+                    tag_id,
+                    rel_path,
+                    payload.get("body", ""),
+                    payload.get("doi", ""),
+                    payload.get("doi_url", ""),
+                    payload.get("scholar_url", ""),
+                    payload.get("cnki_url", ""),
+                    now_iso(),
+                    now_iso(),
+                ),
+            )
+        self.save()
+
+    def get_or_create_tag(self, name: str, color: str | None = None) -> tuple[int, str]:
+        name = name.strip() or "未分类"
+        row = self.conn.execute("SELECT id, color FROM tags WHERE name = ?", (name,)).fetchone()
+        if row:
+            return int(row["id"]), row["color"]
+        count = self.conn.execute("SELECT COUNT(*) AS total FROM tags").fetchone()["total"]
+        assigned = color or TAG_COLORS[count % len(TAG_COLORS)]
+        cursor = self.conn.execute(
+            "INSERT INTO tags (name, color, created_at, updated_at) VALUES (?, ?, ?, ?)",
+            (name, assigned, now_iso(), now_iso()),
+        )
+        self.conn.commit()
+        return int(cursor.lastrowid), assigned
+
+    def tags(self) -> list[dict]:
+        return [dict(row) for row in self.conn.execute("SELECT * FROM tags ORDER BY name")]
+
+    def delete_tag(self, tag_name: str) -> tuple[bool, str]:
+        row = self.conn.execute("SELECT id FROM tags WHERE name = ?", (tag_name,)).fetchone()
+        if not row:
+            return False, "标签不存在。"
+        total = self.conn.execute("SELECT COUNT(*) AS total FROM image_records WHERE tag_id = ?", (row["id"],)).fetchone()["total"]
+        if total:
+            return False, "该标签下还有图片记录，不能删除。"
+        self.conn.execute("DELETE FROM tags WHERE id = ?", (row["id"],))
+        self.conn.commit()
+        return True, ""
+
+    def relative_image_path(self, path_value: str, tag_name: str) -> str:
+        p = Path(path_value)
+        try:
+            return str(p.relative_to(DATA_DIR)).replace("\\", "/")
+        except ValueError:
+            if p.exists():
+                target_dir = IMAGE_DIR / safe_folder_name(tag_name)
+                target_dir.mkdir(parents=True, exist_ok=True)
+                suffix = p.suffix.lower() if p.suffix.lower() in [".png", ".jpg", ".jpeg"] else ".png"
+                stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                target = target_dir / f"{stamp}_{safe_folder_name(tag_name)}_001{suffix}"
+                counter = 1
+                while target.exists():
+                    counter += 1
+                    target = target_dir / f"{stamp}_{safe_folder_name(tag_name)}_{counter:03d}{suffix}"
+                shutil.copy2(p, target)
+                return str(target.relative_to(DATA_DIR)).replace("\\", "/")
+            name = p.name or f"missing_{time.time_ns()}.png"
+            return f"images/{safe_folder_name(tag_name)}/{name}"
+
+    def update_image_tag(self, image_id: str, new_tag_name: str) -> None:
+        row = self.conn.execute("SELECT * FROM image_records WHERE id = ?", (image_id,)).fetchone()
+        if not row:
+            return
+        tag_id, _ = self.get_or_create_tag(new_tag_name)
+        old_path = DATA_DIR / row["image_path"]
+        new_dir = IMAGE_DIR / safe_folder_name(new_tag_name)
+        new_dir.mkdir(parents=True, exist_ok=True)
+        new_path = new_dir / old_path.name
+        if old_path.exists() and old_path.resolve() != new_path.resolve():
+            shutil.move(str(old_path), str(new_path))
+        rel_path = str(new_path.relative_to(DATA_DIR)).replace("\\", "/")
+        self.conn.execute(
+            "UPDATE image_records SET tag_id = ?, image_path = ?, updated_at = ? WHERE id = ?",
+            (tag_id, rel_path, now_iso(), image_id),
+        )
         self.save()
 
 
 def load_config() -> dict:
     APP_DIR.mkdir(parents=True, exist_ok=True)
-    return read_json(CONFIG_PATH, Store.default_config())
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    bootstrap = Store(USER)
+    bootstrap.conn.close()
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    saved = {
+        "remember": conn.execute("SELECT value FROM settings WHERE key = 'saved_login.remember'").fetchone(),
+        "username": conn.execute("SELECT value FROM settings WHERE key = 'saved_login.username'").fetchone(),
+        "password_cache": conn.execute("SELECT value FROM settings WHERE key = 'saved_login.password_cache'").fetchone(),
+        "last_user": conn.execute("SELECT value FROM settings WHERE key = 'last_user'").fetchone(),
+    }
+    conn.close()
+    return {
+        "last_user": saved["last_user"]["value"] if saved["last_user"] else USER,
+        "saved_login": {
+            "remember": (saved["remember"]["value"] == "1") if saved["remember"] else False,
+            "username": saved["username"]["value"] if saved["username"] else "",
+            "password_cache": saved["password_cache"]["value"] if saved["password_cache"] else "",
+        },
+    }
 
 
 def password_hash(password: str, salt: str) -> str:
@@ -266,37 +572,64 @@ def ensure_login_user(config: dict, username: str, password: str) -> tuple[bool,
     username = username.strip()
     if not username:
         return False, "请输入账号。"
-    users = config.setdefault("users", {})
-    user = users.setdefault(
-        username,
-        {
-            "data_dir": str(DATA_DIR),
-            "created_at": now_iso(),
-            "background": {"type": "color", "value": DEFAULT_THEME["window"]},
-        },
-    )
-    current_hash = user.get("password_hash", "")
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    row = conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
+    if not row:
+        conn.execute(
+            "INSERT INTO users (username, created_at, updated_at) VALUES (?, ?, ?)",
+            (username, now_iso(), now_iso()),
+        )
+        row = conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
+    current_hash = row["password_hash"] or ""
     is_current_format = len(current_hash) == 64 and all(ch in "0123456789abcdef" for ch in current_hash.lower())
-    if "password_hash" not in user or not is_current_format:
+    if not current_hash or not is_current_format:
         salt = secrets.token_hex(16)
-        user["salt"] = salt
-        user["password_hash"] = password_hash(password, salt)
-        config["last_user"] = username
-        write_json(CONFIG_PATH, config)
+        conn.execute(
+            "UPDATE users SET salt = ?, password_hash = ?, updated_at = ? WHERE username = ?",
+            (salt, password_hash(password, salt), now_iso(), username),
+        )
+        conn.execute(
+            """
+            INSERT INTO settings (key, value, updated_at) VALUES ('last_user', ?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+            """,
+            (username, now_iso()),
+        )
+        conn.commit()
+        conn.close()
         return True, ""
-    if user["password_hash"] == password_hash(password, user.get("salt", ""),):
-        config["last_user"] = username
-        write_json(CONFIG_PATH, config)
+    if current_hash == password_hash(password, row["salt"] or ""):
+        conn.execute(
+            """
+            INSERT INTO settings (key, value, updated_at) VALUES ('last_user', ?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+            """,
+            (username, now_iso()),
+        )
+        conn.commit()
+        conn.close()
         return True, ""
+    conn.close()
     return False, "密码不正确。"
 
 
 def remember_login(config: dict, username: str, password: str, remember: bool) -> None:
-    if remember:
-        config["saved_login"] = {"remember": True, "username": username, "password_cache": password}
-    else:
-        config["saved_login"] = {"remember": False, "username": username, "password_cache": ""}
-    write_json(CONFIG_PATH, config)
+    conn = sqlite3.connect(DB_PATH)
+    for key, value in {
+        "saved_login.remember": "1" if remember else "0",
+        "saved_login.username": username,
+        "saved_login.password_cache": password if remember else "",
+    }.items():
+        conn.execute(
+            """
+            INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+            """,
+            (key, value, now_iso()),
+        )
+    conn.commit()
+    conn.close()
 
 
 @dataclass
@@ -362,11 +695,8 @@ class SideBar(QWidget):
     def pick_background(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "选择背景图", str(Path.home()), "Images (*.png *.jpg *.jpeg *.bmp)")
         if path:
-            self.store.config.setdefault("users", {}).setdefault(self.store.user, {})["background"] = {
-                "type": "image",
-                "value": path,
-            }
-            self.store.save()
+            self.store.set_setting("background.type", "image")
+            self.store.set_setting("background.value", path)
             self.appearance_changed.emit()
 
     def background_opacity(self) -> None:
@@ -383,15 +713,12 @@ class SideBar(QWidget):
             self.appearance_changed.emit()
 
     def reset_background(self) -> None:
-        self.store.config.setdefault("users", {}).setdefault(self.store.user, {})["background"] = {
-            "type": "color",
-            "value": self.store.theme["window"],
-        }
-        self.store.save()
+        self.store.set_setting("background.type", "color")
+        self.store.set_setting("background.value", self.store.theme["window"])
         self.appearance_changed.emit()
 
     def show_data_path(self) -> None:
-        QMessageBox.information(self, "数据位置", f"配置：{CONFIG_PATH}\n数据：{self.store.data_path}")
+        QMessageBox.information(self, "数据位置", f"数据库：{DB_PATH}\n图片：{IMAGE_DIR}")
 
     def set_active(self, key: str) -> None:
         for name, button in self.buttons.items():
@@ -507,9 +834,10 @@ class BackgroundWidget(QWidget):
         painter = QPainter(self)
         theme = self.store.theme
         painter.fillRect(self.rect(), QColor(theme["window"]))
-        bg = self.store.config.get("users", {}).get(self.store.user, {}).get("background", {})
-        if bg.get("type") == "image":
-            pix = QPixmap(bg.get("value", ""))
+        bg_type = self.store.get_setting("background.type", "color")
+        bg_value = self.store.get_setting("background.value", theme["window"])
+        if bg_type == "image":
+            pix = QPixmap(bg_value)
             if not pix.isNull():
                 painter.setOpacity(max(0, min(100, int(theme.get("background_opacity", 18)))) / 100)
                 scaled = pix.scaled(self.size(), Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
@@ -689,18 +1017,12 @@ class ThemeDialog(QDialog):
     def pick_background(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "选择背景图", str(Path.home()), "Images (*.png *.jpg *.jpeg *.bmp)")
         if path:
-            self.store.config.setdefault("users", {}).setdefault(self.store.user, {})["background"] = {
-                "type": "image",
-                "value": path,
-            }
-            self.store.save()
+            self.store.set_setting("background.type", "image")
+            self.store.set_setting("background.value", path)
 
     def reset_background(self) -> None:
-        self.store.config.setdefault("users", {}).setdefault(self.store.user, {})["background"] = {
-            "type": "color",
-            "value": self.theme["window"],
-        }
-        self.store.save()
+        self.store.set_setting("background.type", "color")
+        self.store.set_setting("background.value", self.theme["window"])
 
     def pick_color(self, key: str) -> None:
         dlg = ColorPickerDialog(self.labels[key], self.theme[key], self)
@@ -899,6 +1221,7 @@ class FiguresPage(QWidget):
         super().__init__()
         self.state = state
         self.image_paths: list[str] = []
+        self.active_tag: str | None = None
         layout = QGridLayout(self)
         layout.setSpacing(12)
         layout.setColumnStretch(0, 1)
@@ -936,23 +1259,10 @@ class FiguresPage(QWidget):
         self.search = QLineEdit()
         self.search.setPlaceholderText("搜索题目、标签、备注")
         self.search.textChanged.connect(self.refresh)
-        tabs = QHBoxLayout()
-        self.all_btn = QPushButton("全部")
-        self.tag_btn = QPushButton("区位图")
-        self.all_btn.setCheckable(True)
-        self.tag_btn.setCheckable(True)
-        self.all_btn.setChecked(True)
-        group = QButtonGroup(self)
-        group.addButton(self.all_btn)
-        group.addButton(self.tag_btn)
-        self.all_btn.clicked.connect(self.refresh)
-        self.tag_btn.clicked.connect(self.refresh)
-        tabs.addWidget(self.all_btn)
-        tabs.addWidget(self.tag_btn)
-        tabs.addStretch()
+        self.tag_filters = QHBoxLayout()
         self.list = QVBoxLayout()
         library.layout.addWidget(self.search)
-        library.layout.addLayout(tabs)
+        library.layout.addLayout(self.tag_filters)
         library.layout.addLayout(self.list)
 
         layout.addWidget(form, 0, 0)
@@ -968,6 +1278,9 @@ class FiguresPage(QWidget):
     def save_figure(self) -> None:
         if not self.title.text().strip():
             QMessageBox.warning(self, "缺少题目", "请先填写论文题目。")
+            return
+        if not self.image_paths:
+            QMessageBox.warning(self, "缺少图片", "请至少选择一张图谱图片。")
             return
         title = self.title.text().strip()
         doi = self.doi.text().strip()
@@ -994,22 +1307,48 @@ class FiguresPage(QWidget):
         self.image_label.setText("已选 0 张图片")
 
     def refresh(self) -> None:
+        self.state.store.data = self.state.store.load_data()
+        self.refresh_tag_filters()
         clear_layout(self.list)
         needle = self.search.text().strip().lower()
-        only_location = self.tag_btn.isChecked()
         for note in self.state.store.data.get("figure_notes", []):
             text = " ".join([note.get("title", ""), note.get("body", ""), " ".join(note.get("tags", []))]).lower()
             if needle and needle not in text:
                 continue
-            if only_location and "区位图" not in note.get("tags", []):
+            if self.active_tag and self.active_tag not in note.get("tags", []):
                 continue
-            self.list.addWidget(FigureCard(note))
+            self.list.addWidget(FigureCard(note, self.state.store, self.state.refresh))
         self.list.addStretch()
+
+    def refresh_tag_filters(self) -> None:
+        clear_layout(self.tag_filters)
+        all_btn = QPushButton("全部")
+        all_btn.setCheckable(True)
+        all_btn.setChecked(self.active_tag is None)
+        all_btn.clicked.connect(lambda: self.set_tag_filter(None))
+        self.tag_filters.addWidget(all_btn)
+        for tag in self.state.store.tags():
+            btn = QPushButton(tag["name"])
+            btn.setCheckable(True)
+            btn.setChecked(self.active_tag == tag["name"])
+            btn.setStyleSheet(
+                f"background:{tag['color']}; color:{readable_text_color(tag['color'])}; border-color:{tag['color']};"
+            )
+            btn.clicked.connect(lambda _=False, name=tag["name"]: self.set_tag_filter(name))
+            self.tag_filters.addWidget(btn)
+        self.tag_filters.addStretch()
+
+    def set_tag_filter(self, tag_name: str | None) -> None:
+        self.active_tag = tag_name
+        self.refresh()
 
 
 class FigureCard(QFrame):
-    def __init__(self, note: dict) -> None:
+    def __init__(self, note: dict, store: Store, on_changed: Callable[[], None]) -> None:
         super().__init__()
+        self.note = note
+        self.store = store
+        self.on_changed = on_changed
         self.setObjectName("innerCard")
         layout = QVBoxLayout(self)
         title = QLabel(note.get("title", "未命名图谱"))
@@ -1020,9 +1359,18 @@ class FigureCard(QFrame):
         for tag in note.get("tags", []):
             label = QLabel(tag)
             label.setObjectName("tag")
+            color = note.get("tag_color", "#f5b183")
+            label.setStyleSheet(
+                f"background:{color}; color:{readable_text_color(color)}; border-radius:8px; padding:5px 10px;"
+            )
             tags.addWidget(label)
         tags.addStretch()
         layout.addLayout(tags)
+        if note.get("body"):
+            note_label = QLabel(note.get("body", ""))
+            note_label.setWordWrap(True)
+            note_label.setObjectName("muted")
+            layout.addWidget(note_label)
         images = note.get("images", [])
         if images:
             strip = QHBoxLayout()
@@ -1035,6 +1383,8 @@ class FigureCard(QFrame):
                     thumb.setPixmap(pix.scaled(150, 110, Qt.KeepAspectRatio, Qt.SmoothTransformation))
                 else:
                     thumb.setText("图片缺失")
+                thumb.setToolTip("点击查看原图")
+                thumb.mousePressEvent = lambda event, path=img.get("value", ""): self.show_preview(path)
                 strip.addWidget(thumb)
             strip.addStretch()
             layout.addLayout(strip)
@@ -1044,8 +1394,37 @@ class FigureCard(QFrame):
                 btn = QPushButton(text)
                 btn.clicked.connect(lambda _=False, url=note[key]: webbrowser.open(url))
                 links.addWidget(btn)
+        edit_tag = QPushButton("修改标签")
+        edit_tag.clicked.connect(self.edit_tag)
+        links.addWidget(edit_tag)
         links.addStretch()
         layout.addLayout(links)
+
+    def show_preview(self, path: str) -> None:
+        dlg = QDialog(self)
+        dlg.setWindowTitle("图片预览")
+        dlg.resize(900, 650)
+        layout = QVBoxLayout(dlg)
+        label = QLabel()
+        label.setAlignment(Qt.AlignCenter)
+        pix = QPixmap(path)
+        if pix.isNull():
+            label.setText("图片文件缺失")
+        else:
+            label.setPixmap(pix.scaled(860, 580, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        layout.addWidget(label)
+        close = QPushButton("关闭")
+        close.clicked.connect(dlg.accept)
+        layout.addWidget(close)
+        dlg.exec()
+
+    def edit_tag(self) -> None:
+        current = (self.note.get("tags") or ["未分类"])[0]
+        tag_name, ok = QInputDialog.getText(self, "修改标签", "新的标签名称：", text=current)
+        if not ok or not tag_name.strip():
+            return
+        self.store.update_image_tag(self.note.get("id", ""), tag_name.strip())
+        self.on_changed()
 
 
 class TrendChart(QWidget):
